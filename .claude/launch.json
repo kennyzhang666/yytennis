@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "yy-tennis",
+      "runtimeExecutable": "npm.cmd",
+      "runtimeArgs": ["run", "dev", "--", "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
+      "port": 5173
+    },
+    {
+      "name": "yy-tennis-build",
+      "runtimeExecutable": "npm.cmd",
+      "runtimeArgs": ["run", "preview", "--", "--host", "127.0.0.1", "--port", "4173", "--strictPort"],
+      "port": 4173
+    }
+  ]
+}
