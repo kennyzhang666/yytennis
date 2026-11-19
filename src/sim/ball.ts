@@ -11,6 +11,8 @@ export interface Ball {
   retention: number;
   /** Visual spin in rad/s. */
   spin: number;
+  /** 0..1, how much charge the last shot carried. */
+  charge: number;
   held: boolean;
   rolling: boolean;
 }
@@ -28,6 +30,7 @@ export function createBall(): Ball {
     restitution: BOUNCE.restitution,
     retention: BOUNCE.retention,
     spin: 0,
+    charge: 0,
     held: true,
     rolling: false,
   };

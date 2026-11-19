@@ -67,6 +67,26 @@ export const SWING = {
   slowFactor: 0.6,
 } as const;
 
+export const CHARGE = {
+  /** Holding for less than this is an ordinary tap. */
+  startAfter: 0.12,
+  fullAfter: 0.9,
+  /** Players move more slowly while winding up. */
+  moveFactor: 0.62,
+  speedBonus: 0.42,
+  serveSpeedBonus: 0.24,
+  /** Heavy topspin dips harder, which lets a faster ball still clear the net. */
+  gravityBonus: 0.75,
+  /** A full charge narrows the timing window by this fraction. */
+  timingTighten: 0.28,
+  /** How much a heavy incoming ball hurts the quality of the return. */
+  heavyQualityLoss: 0.24,
+  /** A charge still held this far past the contact point fires on its own. */
+  autoReleasePast: 0.45,
+  /** A toss click released sooner than this is a tap, not a serve. */
+  serveTapLimit: 0.3,
+} as const;
+
 export const SMASH = {
   standHeight: 2.15,
   airHeight: 1.85,

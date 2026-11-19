@@ -1,23 +1,28 @@
-import { ARENA, PLAYER, SWING } from './constants';
-import { clamp } from './math';
+import { ARENA, CHARGE, PLAYER, SWING } from './constants';
+import { clamp, clamp01 } from './math';
+import type { ShotKind } from './shot';
 import { sideDir, type Side, type Vec3 } from './types';
 
 export type SwingHand = 'fore' | 'back' | 'over';
 
 export interface Swing {
-  /** Seconds since the button was pressed. */
+  /** Seconds since the swing was committed. */
   t: number;
   /** Still waiting for the ball to arrive. */
   armed: boolean;
   serve: boolean;
   hand: SwingHand;
-  /** 0..1, how close the ball is to the contact point. Drives the animation. */
+  /** 0..1, how close the ball is to the contact point. */
   approach: number;
   /** Swing time at which contact (or the miss) happened. */
   releaseT: number | null;
   whiff: boolean;
   contact: Vec3 | null;
   timingError: number;
+  /** 0..1, stored power carried into this swing. */
+  charge: number;
+  /** The shot that was actually played, known from contact onwards. */
+  shot: ShotKind | null;
 }
 
 export interface Player {
@@ -29,12 +34,19 @@ export interface Player {
   swing: Swing | null;
   /** Seconds since the serve toss began, or -1. */
   tossTime: number;
+  /** Seconds the swing button has been held for a charge, or -1. */
+  chargeTime: number;
+  chargeLevel: number;
   speedFactor: number;
   powerScale: number;
   reachScale: number;
   timingScale: number;
   contactDelay: number;
   lastAimX: number;
+}
+
+export function chargeLevelFor(heldSeconds: number): number {
+  return clamp01((heldSeconds - CHARGE.startAfter) / (CHARGE.fullAfter - CHARGE.startAfter));
 }
 
 export function createPlayer(side: Side): Player {
@@ -47,6 +59,8 @@ export function createPlayer(side: Side): Player {
     onGround: true,
     swing: null,
     tossTime: -1,
+    chargeTime: -1,
+    chargeLevel: 0,
     speedFactor: 1,
     powerScale: 1,
     reachScale: 1,

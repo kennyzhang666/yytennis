@@ -11,6 +11,7 @@ import {
 import {
   ARENA,
   BOUNCE,
+  CHARGE,
   COURT,
   GRAVITY,
   netHeight,
@@ -22,7 +23,16 @@ import {
   TIMERS,
 } from './constants';
 import { clamp, clamp01, createRng, lerp, type Rng } from './math';
-import { createPlayer, FREE_MOVEMENT, inReach, movePlayer, type MoveLimits, type Player, type Swing } from './player';
+import {
+  chargeLevelFor,
+  createPlayer,
+  FREE_MOVEMENT,
+  inReach,
+  movePlayer,
+  type MoveLimits,
+  type Player,
+  type Swing,
+} from './player';
 import {
   applyShotError,
   SHOT_PROFILES,
@@ -58,18 +68,44 @@ export type GameEvent =
       x: number;
       y: number;
       z: number;
+      vx: number;
+      vy: number;
+      vz: number;
       speed: number;
       rally: number;
+      charge: number;
     }
-  | { type: 'swing'; side: Side }
+  | { type: 'swing'; side: Side; charge: number }
   | { type: 'whiff'; side: Side }
   | { type: 'toss'; side: Side }
-  | { type: 'jump'; side: Side }
-  | { type: 'land'; side: Side }
-  | { type: 'bounce'; x: number; z: number; speed: number; live: boolean; isIn: boolean }
+  | { type: 'jump'; side: Side; x: number; z: number }
+  | { type: 'land'; side: Side; x: number; z: number }
+  | { type: 'charge-full'; side: Side }
+  | {
+      type: 'bounce';
+      x: number;
+      z: number;
+      vx: number;
+      vz: number;
+      speed: number;
+      live: boolean;
+      isIn: boolean;
+      /** Metres inside (positive) or outside (negative) the nearest relevant line. */
+      margin: number;
+      charge: number;
+    }
   | { type: 'net'; x: number; y: number; speed: number }
   | { type: 'fault'; side: Side; reason: FaultReason; serveNumber: 1 | 2 }
-  | { type: 'point'; winner: Side; reason: PointReason; loserOfRally: Side; rally: number; points: [number, number] }
+  | {
+      type: 'point';
+      winner: Side;
+      reason: PointReason;
+      loserOfRally: Side;
+      rally: number;
+      points: [number, number];
+      margin: number | null;
+      matchPoint: boolean;
+    }
   | { type: 'serve-ready'; server: Side; serveNumber: 1 | 2; deuce: boolean }
   | { type: 'match-end'; winner: Side };
 
@@ -81,6 +117,7 @@ export interface PlayerStats {
   errors: number;
   doubleFaults: number;
   topSpeed: number;
+  chargedHits: number;
 }
 
 export interface ServiceBox {
@@ -131,6 +168,7 @@ const newStats = (): PlayerStats => ({
   errors: 0,
   doubleFaults: 0,
   topSpeed: 0,
+  chargedHits: 0,
 });
 
 const TOSS_SPEED = Math.sqrt(2 * GRAVITY * (SERVE.tossApex - SERVE.handHeight));
@@ -188,6 +226,7 @@ export class World {
   longestRally = 0;
   tossTime = 0;
 
+  private lastMargin: number | null = null;
   private path: BallPath = { segments: [], hitsNet: false, firstBounce: null };
   private pathTick = -1;
   private readonly ballEvents: BallEvent[] = [];
@@ -234,13 +273,17 @@ export class World {
     return serviceBoxFor(this.server, this.pointIndex);
   }
 
+  get isLive(): boolean {
+    return this.phase === 'rally' || this.phase === 'serve';
+  }
+
   isServing(side: Side): boolean {
     return side === this.server && (this.phase === 'ready' || this.phase === 'toss');
   }
 
   /** True while the ball is travelling towards this player and is still live. */
   isIncoming(side: Side): boolean {
-    if (this.phase !== 'rally' && this.phase !== 'serve') return false;
+    if (!this.isLive) return false;
     return this.lastHitter !== null && this.lastHitter !== side && !this.getPath().hitsNet;
   }
 
@@ -276,7 +319,7 @@ export class World {
 
   /** Where the ball will first touch the ground, while that is still ahead. */
   predictedLanding(): Landing | null {
-    if ((this.phase !== 'rally' && this.phase !== 'serve') || this.bounces > 0) return null;
+    if (!this.isLive || this.bounces > 0) return null;
     const path = this.getPath();
     if (!path.firstBounce || path.hitsNet || this.lastHitter === null) return null;
     const { t, x, z } = path.firstBounce;
@@ -289,7 +332,9 @@ export class World {
   }
 
   canSwing(side: Side): boolean {
-    const swing = this.players[side].swing;
+    const p = this.players[side];
+    if (p.chargeTime >= 0) return false;
+    const swing = p.swing;
     if (!swing) return true;
     if (swing.armed) return false;
     return swing.t - (swing.releaseT ?? swing.t) >= SWING.rearmAfter;
@@ -310,6 +355,11 @@ export class World {
       x: clamp(u, -1, 1) * (COURT.halfWidth - 0.16),
       z: dir * lerp(1.9, COURT.halfLength - 0.35, clamp01(v)),
     };
+  }
+
+  /** Lets a replay take the place of the pause that follows a point. */
+  skipPointDelay(): void {
+    if (this.phase === 'dead') this.phaseTime = TIMERS.pointEnd;
   }
 
   // ---------------------------------------------------------------------------
@@ -417,16 +467,17 @@ export class World {
     }
 
     if (p.swing && p.swing.t < SWING.slowFor) scale *= SWING.slowFactor;
+    if (p.chargeLevel > 0) scale *= CHARGE.moveFactor;
 
-    const canJump = this.phase === 'serve' || this.phase === 'rally' || this.phase === 'dead' || !serving;
+    const canJump = this.isLive || this.phase === 'dead' || !serving;
     if (intent.jump && p.onGround && canJump && this.phase !== 'reset' && this.phase !== 'over') {
       p.onGround = false;
       p.vel.y = PLAYER.jumpSpeed;
-      this.emit({ type: 'jump', side: p.side });
+      this.emit({ type: 'jump', side: p.side, x: p.pos.x, z: p.pos.z });
     }
 
     movePlayer(p, moveX, moveZ, scale, limits, TICK);
-    if (!wasGrounded && p.onGround) this.emit({ type: 'land', side: p.side });
+    if (!wasGrounded && p.onGround) this.emit({ type: 'land', side: p.side, x: p.pos.x, z: p.pos.z });
   }
 
   private updateBall(): void {
@@ -469,57 +520,65 @@ export class World {
     b.vel.y = 0;
     b.vel.z = 0;
     b.spin = 0;
+    b.charge = 0;
+  }
+
+  private serviceMargin(x: number, z: number): number {
+    const box = this.serviceBox;
+    return Math.min(x - box.minX, box.maxX - x, COURT.serviceLine - Math.abs(z), z * box.zSign);
+  }
+
+  private courtMargin(side: Side, x: number, z: number): number {
+    return Math.min(COURT.halfWidth - Math.abs(x), COURT.halfLength - Math.abs(z), z * sideDir(side));
   }
 
   private inServiceBox(x: number, z: number): boolean {
-    const box = this.serviceBox;
-    const tol = COURT.lineTolerance;
-    return (
-      z * box.zSign > -tol &&
-      Math.abs(z) <= COURT.serviceLine + tol &&
-      x >= box.minX - tol &&
-      x <= box.maxX + tol
-    );
+    return this.serviceMargin(x, z) >= -COURT.lineTolerance;
   }
 
   private inCourtOf(side: Side, x: number, z: number): boolean {
-    const tol = COURT.lineTolerance;
-    return z * sideDir(side) > 0 && Math.abs(x) <= COURT.halfWidth + tol && Math.abs(z) <= COURT.halfLength + tol;
+    return z * sideDir(side) > 0 && this.courtMargin(side, x, z) >= -COURT.lineTolerance;
+  }
+
+  private emitBounce(x: number, z: number, speed: number, live: boolean, isIn: boolean, margin: number): void {
+    const b = this.ball;
+    this.emit({ type: 'bounce', x, z, vx: b.vel.x, vz: b.vel.z, speed, live, isIn, margin, charge: b.charge });
+    b.charge *= 0.5;
   }
 
   private onBounce(x: number, z: number, speed: number): void {
-    let live = false;
-    let isIn = false;
     if (this.phase === 'serve') {
-      live = true;
       this.bounces = 1;
-      isIn = this.inServiceBox(x, z);
-      this.emit({ type: 'bounce', x, z, speed, live, isIn });
+      const margin = this.serviceMargin(x, z);
+      const isIn = this.inServiceBox(x, z);
+      this.lastMargin = margin;
+      this.emitBounce(x, z, speed, true, isIn, margin);
       if (isIn) this.setPhase('rally');
       else this.fault('out');
       return;
     }
     if (this.phase === 'rally' && this.lastHitter !== null) {
-      live = true;
       this.bounces++;
       const hitter = this.lastHitter;
       const receiver = otherSide(hitter);
       if (this.bounces === 1) {
-        isIn = this.inCourtOf(receiver, x, z);
-        this.emit({ type: 'bounce', x, z, speed, live, isIn });
+        const margin = this.courtMargin(receiver, x, z);
+        const isIn = this.inCourtOf(receiver, x, z);
+        this.lastMargin = margin;
+        this.emitBounce(x, z, speed, true, isIn, margin);
         if (!isIn) this.endPoint(receiver, 'out');
       } else {
-        isIn = true;
-        this.emit({ type: 'bounce', x, z, speed, live, isIn });
+        this.emitBounce(x, z, speed, true, true, 1);
         this.endPoint(hitter, this.rally === 1 ? 'ace' : 'winner');
       }
       return;
     }
-    this.emit({ type: 'bounce', x, z, speed, live, isIn });
+    this.emitBounce(x, z, speed, false, false, 1);
   }
 
   private onNet(x: number, y: number, speed: number): void {
     this.emit({ type: 'net', x, y, speed });
+    this.lastMargin = null;
     if (this.phase === 'serve') this.fault('net');
     else if (this.phase === 'rally' && this.lastHitter !== null) {
       this.endPoint(otherSide(this.lastHitter), 'net');
@@ -559,6 +618,8 @@ export class World {
       loserOfRally: loser,
       rally: this.rally,
       points: [this.points[0], this.points[1]],
+      margin: reason === 'out' || reason === 'double-fault' ? this.lastMargin : null,
+      matchPoint: this.winner !== null,
     });
   }
 
@@ -635,6 +696,7 @@ export class World {
     this.lastHitter = null;
     this.bounces = 0;
     this.rally = 0;
+    this.lastMargin = null;
     this.placeBallInHand();
     b.prevPos.x = b.pos.x;
     b.prevPos.y = b.pos.y;
@@ -649,6 +711,10 @@ export class World {
     server.vel.x = 0;
     server.vel.z = 0;
     server.tossTime = -1;
+    for (const p of this.players) {
+      p.chargeTime = -1;
+      p.chargeLevel = 0;
+    }
     this.holdBall();
     this.tossTime = 0;
     this.readyId++;
@@ -675,7 +741,7 @@ export class World {
     );
   }
 
-  private startSwing(p: Player, serve: boolean): Swing {
+  private startSwing(p: Player, serve: boolean, charge: number): Swing {
     const dx = this.ball.pos.x - p.pos.x;
     const swing: Swing = {
       t: 0,
@@ -687,9 +753,11 @@ export class World {
       whiff: false,
       contact: null,
       timingError: 0,
+      charge,
+      shot: null,
     };
     p.swing = swing;
-    this.emit({ type: 'swing', side: p.side });
+    this.emit({ type: 'swing', side: p.side, charge });
     return swing;
   }
 
@@ -717,9 +785,34 @@ export class World {
     b.vel.y = TOSS_SPEED;
     b.vel.z = 0;
     p.tossTime = 0;
+    p.chargeTime = 0;
+    p.chargeLevel = 0;
     this.tossTime = 0;
     this.setPhase('toss');
     this.emit({ type: 'toss', side: this.server });
+  }
+
+  private strikeServe(p: Player, charge: number): void {
+    const swing = this.startSwing(p, true, charge);
+    swing.timingError = this.tossTime - IDEAL_TOSS_TIME;
+  }
+
+  /** True when the ball is close enough for a press to count as a swing at it. */
+  private inSwingWindow(p: Player): boolean {
+    const crossing = this.crossing(p.side);
+    if (crossing) return crossing.t <= SWING.lead + SWING.earlyWindow;
+    return this.ballInReach(p.side);
+  }
+
+  private commitSwing(p: Player, charge: number): void {
+    const swing = this.startSwing(p, false, charge);
+    const crossing = this.crossing(p.side);
+    if (crossing) {
+      swing.hand = (crossing.x - p.pos.x) * sideDir(p.side) >= 0 ? 'fore' : 'back';
+      if (crossing.t > SWING.lead + SWING.earlyWindow) this.disarm(p, swing);
+    } else if (!this.ballInReach(p.side)) {
+      this.disarm(p, swing);
+    }
   }
 
   private onSwingPressed(p: Player): void {
@@ -729,26 +822,67 @@ export class World {
       return;
     }
     if (this.phase === 'toss') {
-      if (side !== this.server || this.ball.pos.y < SERVE.minHitHeight || !this.canSwing(side)) return;
-      const swing = this.startSwing(p, true);
-      swing.timingError = this.tossTime - IDEAL_TOSS_TIME;
+      if (side !== this.server || this.ball.pos.y < SERVE.minHitHeight) return;
+      if (p.chargeTime >= 0 && p.chargeTime < CHARGE.serveTapLimit) p.chargeTime = -1;
+      if (!this.canSwing(side)) return;
+      this.strikeServe(p, 0);
       return;
     }
-    if ((this.phase !== 'rally' && this.phase !== 'serve') || !this.canSwing(side)) return;
+    if (!this.isLive || !this.canSwing(side)) return;
 
-    const swing = this.startSwing(p, false);
-    const crossing = this.crossing(side);
-    if (crossing) {
-      swing.hand = (crossing.x - p.pos.x) * sideDir(side) >= 0 ? 'fore' : 'back';
-      if (crossing.t > SWING.lead + SWING.earlyWindow) this.disarm(p, swing);
-    } else if (!this.ballInReach(side)) {
-      this.disarm(p, swing);
+    // Close to the ball a press swings at once. Earlier than that it winds up.
+    if (this.inSwingWindow(p)) this.commitSwing(p, 0);
+    else p.chargeTime = 0;
+  }
+
+  private clearCharge(p: Player): void {
+    p.chargeTime = -1;
+    p.chargeLevel = 0;
+  }
+
+  private releaseCharge(p: Player): void {
+    const held = p.chargeTime;
+    const level = p.chargeLevel;
+    this.clearCharge(p);
+    if (this.phase === 'toss') {
+      const serving = p.side === this.server;
+      if (serving && held >= CHARGE.serveTapLimit && this.ball.pos.y >= SERVE.minHitHeight && this.canSwing(p.side)) {
+        this.strikeServe(p, level);
+      }
+      return;
     }
+    if (this.isLive && this.canSwing(p.side)) this.commitSwing(p, level);
+  }
+
+  private chargeOverdue(p: Player): boolean {
+    if (!this.canHitBall(p)) return false;
+    const dir = sideDir(p.side);
+    const past = (this.ball.pos.z - (p.pos.z - dir * PLAYER.contactFront)) * dir;
+    return past >= CHARGE.autoReleasePast && inReach(p, this.ball.pos);
+  }
+
+  private updateCharge(p: Player, intent: PlayerIntent): void {
+    if (p.chargeTime < 0) return;
+    const tossing = this.phase === 'toss' && p.side === this.server;
+    if (!this.isLive && !tossing) {
+      this.clearCharge(p);
+      return;
+    }
+    if (!intent.held) {
+      this.releaseCharge(p);
+      return;
+    }
+    const before = p.chargeLevel;
+    p.chargeTime += TICK;
+    p.chargeLevel = chargeLevelFor(p.chargeTime);
+    if (before < 1 && p.chargeLevel >= 1) this.emit({ type: 'charge-full', side: p.side });
+    if (this.isLive && this.chargeOverdue(p)) this.releaseCharge(p);
   }
 
   private updateSwing(p: Player, intent: PlayerIntent): void {
     if (p.swing) p.swing.t += TICK;
     if (intent.swing) this.onSwingPressed(p);
+    this.updateCharge(p, intent);
     const swing = p.swing;
     if (!swing) return;
 
@@ -797,7 +931,9 @@ export class World {
     swing.approach = 1;
     swing.releaseT = swing.t;
     swing.contact = { x: b.pos.x, y: b.pos.y, z: b.pos.z };
-    b.spin = SHOT_PROFILES[kind].spin;
+    swing.shot = kind;
+    b.spin = SHOT_PROFILES[kind].spin * (1 + swing.charge * 0.6);
+    b.charge = swing.charge;
     b.rolling = false;
     this.lastHitter = p.side;
     this.hitId++;
@@ -810,6 +946,7 @@ export class World {
     stats.hits++;
     stats.topSpeed = Math.max(stats.topSpeed, speed);
     if (label === 'perfect') stats.perfects++;
+    if (swing.charge >= 0.35) stats.chargedHits++;
     this.emit({
       type: 'hit',
       side: p.side,
@@ -819,20 +956,24 @@ export class World {
       x: b.pos.x,
       y: b.pos.y,
       z: b.pos.z,
+      vx: b.vel.x,
+      vy: b.vel.y,
+      vz: b.vel.z,
       speed,
       rally: this.rally,
+      charge: swing.charge,
     });
   }
 
-  private setBallFlight(kind: ShotKind, vx: number, vy: number, vz: number, g: number): void {
+  private setBallFlight(kind: ShotKind, vx: number, vy: number, vz: number, g: number, charge: number): void {
     const b = this.ball;
     const profile = SHOT_PROFILES[kind];
     b.vel.x = vx;
     b.vel.y = vy;
     b.vel.z = vz;
     b.g = g;
-    b.restitution = profile.restitution;
-    b.retention = profile.retention;
+    b.restitution = profile.restitution + 0.05 * charge;
+    b.retention = Math.min(0.9, profile.retention + 0.1 * charge);
   }
 
   private executeHit(p: Player, swing: Swing, intent: PlayerIntent, sinceCrossing: number): void {
@@ -840,6 +981,7 @@ export class World {
     const dx = b.pos.x - p.pos.x;
     const timing = SWING.lead - swing.t + sinceCrossing;
     const height = b.pos.y;
+    const charge = swing.charge;
 
     let kind: ShotKind = 'drive';
     if (intent.lob) kind = 'lob';
@@ -849,25 +991,32 @@ export class World {
 
     const profile = SHOT_PROFILES[kind];
     const stretch = clamp01((Math.abs(dx) / (PLAYER.reachX * p.reachScale) - 0.58) / 0.42);
-    const quality = timingQuality(timing, p.timingScale) * (1 - 0.6 * stretch * stretch);
+    const timingScale = p.timingScale * (1 - CHARGE.timingTighten * charge);
+    const heavy = 1 - CHARGE.heavyQualityLoss * b.charge;
+    const quality = timingQuality(timing, timingScale) * (1 - 0.6 * stretch * stretch) * heavy;
 
     const targetDir = -sideDir(p.side) as 1 | -1;
-    const aim = this.aim[p.side];
     const result = applyShotError({
-      target: aim,
+      target: this.aim[p.side],
       kind,
       quality,
       timingError: timing,
       ballSide: Math.sign(dx) || 1,
-      scatter: 1,
+      scatter: 1 + (1 - quality) * charge,
       targetDir,
       rng: this.rng,
     });
     p.lastAimX = result.x;
 
-    const speed = lerp(profile.minSpeed, profile.maxSpeed, quality ** 1.15) * (1 - 0.2 * stretch) * p.powerScale;
-    const shot = this.solveWithMishit(b.pos, result, profile.g, speed, profile.clearance, kind, quality);
-    this.setBallFlight(kind, shot.vx, shot.vy, shot.vz, profile.g);
+    const g = profile.g * (1 + (kind === 'lob' ? 0 : CHARGE.gravityBonus * charge));
+    const speed =
+      lerp(profile.minSpeed, profile.maxSpeed, quality ** 1.15) *
+      (1 - 0.2 * stretch) *
+      p.powerScale *
+      (1 + CHARGE.speedBonus * charge);
+    const clearance = profile.clearance * (1 - 0.35 * charge);
+    const shot = this.solveWithMishit(b.pos, result, g, speed, clearance, kind, quality, charge);
+    this.setBallFlight(kind, shot.vx, shot.vy, shot.vz, g, charge);
     this.launch(p, swing, kind, quality, timing);
   }
 
@@ -879,6 +1028,7 @@ export class World {
     clearance: number,
     kind: ShotKind,
     quality: number,
+    charge: number,
   ) {
     if (target.mishit === 'net') {
       const k = Math.abs(from.z) / Math.max(1e-6, Math.abs(target.z - from.z));
@@ -892,15 +1042,17 @@ export class World {
       g,
       speed,
       clearance,
-      apex: kind === 'lob' ? lerp(4.4, 6.6, quality) : undefined,
+      apex: kind === 'lob' ? lerp(4.4, 6.6, quality) + 1.2 * charge : undefined,
     });
   }
 
   private executeServe(p: Player, swing: Swing): void {
     const b = this.ball;
     const second = this.serveNumber === 2;
+    const charge = swing.charge;
     const profile = SHOT_PROFILES.serve;
-    const quality = timingQuality(swing.timingError, SERVE.timingScale * p.timingScale);
+    const timingScale = SERVE.timingScale * p.timingScale * (1 - CHARGE.timingTighten * charge);
+    const quality = timingQuality(swing.timingError, timingScale);
     const targetDir = this.serviceBox.zSign;
     const result = applyShotError({
       target: this.aim[p.side],
@@ -908,18 +1060,22 @@ export class World {
       quality,
       timingError: swing.timingError,
       ballSide: 1,
-      scatter: second ? 0.5 : 1,
+      scatter: (second ? 0.5 : 1) * (1 + (1 - quality) * charge),
       targetDir,
       rng: this.rng,
     });
     p.lastAimX = result.x;
     p.tossTime = -1;
 
-    const speed = lerp(profile.minSpeed, profile.maxSpeed, quality ** 1.1) * (second ? 0.74 : 1) * p.powerScale;
-    const g = second ? 14 : profile.g;
+    const speed =
+      lerp(profile.minSpeed, profile.maxSpeed, quality ** 1.1) *
+      (second ? 0.74 : 1) *
+      p.powerScale *
+      (1 + CHARGE.serveSpeedBonus * charge);
+    const g = (second ? 14 : profile.g) * (1 + 0.55 * charge);
     const clearance = second ? 0.42 : profile.clearance;
-    const shot = this.solveWithMishit(b.pos, result, g, speed, clearance, 'serve', quality);
-    this.setBallFlight('serve', shot.vx, shot.vy, shot.vz, g);
+    const shot = this.solveWithMishit(b.pos, result, g, speed, clearance, 'serve', quality, charge);
+    this.setBallFlight('serve', shot.vx, shot.vy, shot.vz, g, charge);
     swing.hand = 'over';
     this.launch(p, swing, 'serve', quality, swing.timingError);
     this.setPhase('serve');

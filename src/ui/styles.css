@@ -269,6 +269,7 @@ button {
   position: absolute;
   bottom: calc(22px + var(--safe-b));
   left: 50%;
+  width: max-content;
   max-width: min(84vw, 520px);
   padding: 8px 15px;
   border-radius: 999px;
@@ -316,6 +317,160 @@ button {
 .popup.is-speed {
   color: #ffd27a;
   font-size: 16px;
+}
+
+.popup.is-power {
+  color: #ffb13d;
+  font-size: 27px;
+  text-shadow: 0 0 14px rgba(255, 110, 30, 0.85), 0 2px 6px rgba(0, 18, 38, 0.8);
+}
+
+.charge-vignette {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: radial-gradient(ellipse at center, rgba(255, 140, 30, 0) 58%, rgba(255, 120, 30, 0.2) 82%, rgba(255, 86, 30, 0.46) 100%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.charge-vignette.is-full {
+  animation: charge-beat 0.34s ease-in-out infinite alternate;
+}
+
+@keyframes charge-beat {
+  to {
+    filter: brightness(1.45);
+  }
+}
+
+.replay-btn {
+  position: absolute;
+  top: calc(66px + var(--safe-t));
+  right: calc(12px + var(--safe-r));
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 40px;
+  padding: 0 13px 0 10px;
+  border: 1px solid var(--stroke);
+  border-radius: 12px;
+  background: var(--panel);
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  pointer-events: auto;
+  touch-action: manipulation;
+}
+
+.replay-btn svg {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
+}
+
+.replay-btn:hover {
+  background: rgba(30, 50, 76, 0.92);
+}
+
+.replay-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  overflow: hidden;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.replay-bar {
+  position: absolute;
+  right: 0;
+  left: 0;
+  height: 9%;
+  background: #05101d;
+  transition: transform 0.3s ease-out;
+}
+
+.replay-bar.is-top {
+  top: 0;
+  transform: translateY(-100%);
+}
+
+.replay-bar.is-bottom {
+  bottom: 0;
+  transform: translateY(100%);
+}
+
+.replay-overlay.is-on .replay-bar {
+  transform: none;
+}
+
+.replay-badge {
+  position: absolute;
+  top: calc(9% + 14px);
+  left: calc(16px + var(--safe-l));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 6px 10px;
+  border-radius: 8px;
+  background: rgba(5, 16, 29, 0.72);
+  font-size: 13px;
+  font-style: italic;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+}
+
+.replay-badge i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--coral);
+  animation: replay-dot 1s ease-in-out infinite alternate;
+}
+
+@keyframes replay-dot {
+  to {
+    opacity: 0.25;
+  }
+}
+
+.replay-call {
+  position: absolute;
+  top: calc(9% + 14px);
+  right: calc(16px + var(--safe-r));
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: var(--coral);
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.replay-progress {
+  position: absolute;
+  right: 0;
+  bottom: 9%;
+  left: 0;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.replay-progress span {
+  display: block;
+  height: 100%;
+  background: var(--lime);
+  transform: scaleX(0);
+  transform-origin: left;
+}
+
+.replay-skip {
+  position: absolute;
+  right: 0;
+  bottom: calc(4.5% - 9px);
+  left: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  text-align: center;
 }
 
 @keyframes float-up {
@@ -615,6 +770,17 @@ button {
 .small-panel {
   width: min(100%, 330px);
   margin: auto;
+}
+
+.toggle-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.toggle-row .btn {
+  padding: 0 6px;
+  font-size: 14px;
 }
 
 .brand {
@@ -941,6 +1107,21 @@ h2.is-win {
     font-size: 16px;
   }
 
+  .pause-panel {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    width: min(100%, 460px);
+  }
+
+  .pause-panel h2,
+  .pause-panel .btn-quiet {
+    grid-column: 1 / -1;
+  }
+
+  .pause-panel .toggle-row {
+    grid-column: 1 / -1;
+  }
+
   .result-panel {
     display: grid;
     grid-template-columns: minmax(150px, 0.8fr) minmax(190px, 1fr);
@@ -955,7 +1136,26 @@ h2.is-win {
 
   .result-panel .stats {
     grid-column: 2;
-    grid-row: 1 / span 5;
+    grid-row: 1 / span 6;
+  }
+
+  .replay-bar {
+    height: 7%;
+  }
+
+  .replay-skip {
+    bottom: 0;
+    font-size: 12px;
+    line-height: 25px;
+  }
+
+  .replay-progress {
+    bottom: 7%;
+  }
+
+  .replay-badge,
+  .replay-call {
+    top: calc(7% + 8px);
   }
 
   .result-kicker {

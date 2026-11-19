@@ -2,14 +2,27 @@ import { AudioEngine } from '../audio/AudioEngine';
 import { InputManager, type InputMode } from '../input/InputManager';
 import { AI_PROFILES, AIController, tuningFor, type Difficulty } from '../sim/ai';
 import { PLAYER, SWING, TICK } from '../sim/constants';
+import { createSceneFrame, readWorldFrame } from '../sim/frame';
 import { clamp01 } from '../sim/math';
+import { ReplayRecorder, replayRate, type ReplayClip } from '../sim/replay';
 import { FAR, NEAR, type PlayerIntent } from '../sim/types';
 import { World, type GameEvent, type PointReason } from '../sim/world';
-import { Hud } from '../ui/Hud';
-import { DIFFICULTY_NAMES, Menus } from '../ui/Menus';
+import { Hud, type PopupTone } from '../ui/Hud';
+import { DIFFICULTY_NAMES, Menus, type MatchSummary } from '../ui/Menus';
+import { ReplayDirector } from '../view/replayDirector';
 import { detectTier, SceneView } from '../view/SceneView';
 
-type Mode = 'menu' | 'playing' | 'paused' | 'finished';
+type Mode = 'menu' | 'playing' | 'paused' | 'finished' | 'replay';
+type AfterReplay = 'play' | 'pause' | 'result';
+
+interface ReplaySession {
+  clip: ReplayClip;
+  director: ReplayDirector;
+  time: number;
+  nextEvent: number;
+  keys: number[];
+  after: AfterReplay;
+}
 
 const WIN_TEXT: Record<PointReason, string> = {
   winner: '漂亮的制胜分',
@@ -32,14 +45,19 @@ const TIMING_TEXT = { perfect: '完美！', good: '不错', early: '早了', lat
 /** How much higher a jump lets the racket reach. */
 const JUMP_REACH = (PLAYER.jumpSpeed * PLAYER.jumpSpeed) / (2 * PLAYER.gravity);
 
+/** How long play continues behind the result before the replay cuts in. */
+const REPLAY_DELAY = 0.92;
+const AUTO_REPLAY_SCORE = 5.2;
+
 /** The sim's ball is slower than a real one, so shown speeds are scaled to feel right. */
 const speedKmh = (metersPerSecond: number) => Math.round(metersPerSecond * 3.6 * 1.7);
 
-function loadFlag(key: string): boolean {
+function loadFlag(key: string, fallback = false): boolean {
   try {
-    return localStorage.getItem(key) === '1';
+    const value = localStorage.getItem(key);
+    return value === null ? fallback : value === '1';
   } catch {
-    return false;
+    return fallback;
   }
 }
 
@@ -58,6 +76,8 @@ export class Game {
   private readonly hud: Hud;
   private readonly menus: Menus;
   private readonly reducedMotion: boolean;
+  private readonly frameState = createSceneFrame();
+  private readonly recorder = new ReplayRecorder();
 
   private world: World;
   private ais: [AIController, AIController];
@@ -68,6 +88,22 @@ export class Game {
   private lastFrame = 0;
   private hitStop = 0;
   private tutorialDone = loadFlag('yy.tutorial');
+  private autoReplay = loadFlag('yy.autoReplay', true);
+
+  private pointPending = false;
+  private lastClip: ReplayClip | null = null;
+  private bestClip: ReplayClip | null = null;
+  private pointsSinceReplay = 99;
+  private replay: ReplaySession | null = null;
+  private summary: MatchSummary | null = null;
+
+  private readonly stepClock: [number, number] = [0, 0];
+  private readonly lastVel = [
+    { x: 0, z: 0 },
+    { x: 0, z: 0 },
+  ];
+  private squeakCooldown = 0;
+
   /** Development only: lets automated checks play the human's side. */
   autopilot = false;
   /** Development only: holds the game still between scripted steps. */
@@ -81,6 +117,7 @@ export class Game {
     this.reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
     this.audio.muted = loadFlag('yy.muted');
     this.view = new SceneView(canvas, detectTier());
+    if (this.reducedMotion) this.view.rig.motion = 0;
     this.input = new InputManager(canvas, ui);
     this.hud = new Hud(ui);
     this.menus = new Menus(ui, {
@@ -92,6 +129,17 @@ export class Game {
         this.audio.setMuted(!this.audio.muted);
         saveFlag('yy.muted', this.audio.muted);
         return this.audio.muted;
+      },
+      onToggleAutoReplay: () => {
+        this.autoReplay = !this.autoReplay;
+        saveFlag('yy.autoReplay', this.autoReplay);
+        return this.autoReplay;
+      },
+      onReplayLast: () => {
+        if (this.lastClip) this.startReplay(this.lastClip, 'pause');
+      },
+      onHighlight: () => {
+        if (this.bestClip) this.startReplay(this.bestClip, 'result');
       },
       onClick: () => {
         this.audio.unlock();
@@ -105,12 +153,24 @@ export class Game {
     this.applyAttractTuning();
 
     this.hud.onPause = () => this.pause();
+    this.hud.onReplay = () => this.replayCurrentPoint();
+    this.hud.onSkipReplay = () => this.finishReplay();
     this.input.onPauseKey = () => {
-      if (this.mode === 'playing') this.pause();
+      if (this.mode === 'replay') this.finishReplay();
+      else if (this.mode === 'playing') this.pause();
       else if (this.mode === 'paused') this.resume();
     };
     this.input.onModeChange = (mode) => this.onInputMode(mode);
 
+    window.addEventListener('keydown', (e) => {
+      if (e.repeat) return;
+      if (this.mode === 'replay' && (e.code === 'Space' || e.code === 'Enter')) {
+        e.preventDefault();
+        this.finishReplay();
+      } else if (this.mode === 'playing' && e.code === 'KeyR' && this.world.phase === 'dead') {
+        this.replayCurrentPoint();
+      }
+    });
     window.addEventListener('resize', this.onResize);
     window.addEventListener('orientationchange', this.onResize);
     window.visualViewport?.addEventListener('resize', this.onResize);
@@ -159,7 +219,8 @@ export class Game {
     this.world = new World({ seed: this.seed });
     this.ais = this.createAttractAIs();
     this.applyAttractTuning();
-    this.view.resetForNewMatch(this.world);
+    readWorldFrame(this.world, 1, this.frameState);
+    this.view.resetCourt(this.frameState);
   }
 
   private readonly onResize = (): void => {
@@ -184,6 +245,7 @@ export class Game {
   }
 
   private startMatch(difficulty: Difficulty): void {
+    this.closeReplay();
     this.difficulty = difficulty;
     this.seed = (this.seed + 7919) & 0xfffff;
     this.world = new World({ seed: this.seed, firstServer: NEAR });
@@ -193,7 +255,14 @@ export class Game {
     ];
     this.world.tunePlayer(FAR, tuningFor(AI_PROFILES[difficulty]));
     this.applyHumanTuning();
-    this.view.resetForNewMatch(this.world);
+    readWorldFrame(this.world, 1, this.frameState);
+    this.view.resetCourt(this.frameState);
+    this.recorder.beginPoint();
+    this.pointPending = false;
+    this.lastClip = null;
+    this.bestClip = null;
+    this.summary = null;
+    this.pointsSinceReplay = 99;
     this.accumulator = 0;
     this.hitStop = 0;
     this.mode = 'playing';
@@ -201,6 +270,7 @@ export class Game {
     this.hud.clearTransient();
     this.hud.setOpponent(DIFFICULTY_NAMES[difficulty]);
     this.hud.setVisible(true);
+    this.audio.setCrowdMood('hushed');
     this.refreshScore();
     this.input.setEnabled(true);
   }
@@ -213,7 +283,9 @@ export class Game {
     if (this.mode !== 'playing') return;
     this.mode = 'paused';
     this.input.setEnabled(false);
-    this.menus.showPause(this.audio.muted);
+    this.audio.setCharge(0);
+    this.hud.setChargeLevel(0);
+    this.menus.showPause(this.audio.muted, this.autoReplay, this.lastClip !== null);
   }
 
   private resume(): void {
@@ -225,8 +297,11 @@ export class Game {
   }
 
   private goHome(): void {
+    this.closeReplay();
     this.mode = 'menu';
     this.input.setEnabled(false);
+    this.audio.setCharge(0);
+    this.audio.setCrowdMood('idle');
     this.hud.setVisible(false);
     this.hud.clearTransient();
     this.seed = (this.seed + 104729) & 0xfffff;
@@ -238,32 +313,177 @@ export class Game {
     this.mode = 'finished';
     this.input.setEnabled(false);
     this.hud.setHint(null);
+    this.hud.setChargeLevel(0);
+    this.hud.setReplayButton(false);
+    this.audio.setCharge(0);
+    this.audio.setCrowdMood('idle');
     this.tutorialDone = true;
     saveFlag('yy.tutorial', true);
     const w = this.world;
     const [me, foe] = w.stats;
     const percent = (n: number, d: number) => (d > 0 ? `${Math.round((n / d) * 100)}%` : '–');
-    const rows = [
-      { label: '完美击球', me: percent(me.perfects, me.hits), foe: percent(foe.perfects, foe.hits) },
-      { label: '制胜分', me: String(me.winners), foe: String(foe.winners) },
-      { label: 'ACE', me: String(me.aces), foe: String(foe.aces) },
-      { label: '失误', me: String(me.errors + me.doubleFaults), foe: String(foe.errors + foe.doubleFaults) },
-      {
-        label: '最快球速',
-        me: me.topSpeed ? `${speedKmh(me.topSpeed)}` : '–',
-        foe: foe.topSpeed ? `${speedKmh(foe.topSpeed)}` : '–',
-      },
-    ];
+    this.summary = {
+      won: winner === NEAR,
+      points: w.points,
+      difficulty: this.difficulty,
+      hasHighlight: this.bestClip !== null,
+      rows: [
+        { label: '完美击球', me: percent(me.perfects, me.hits), foe: percent(foe.perfects, foe.hits) },
+        { label: '蓄力球', me: String(me.chargedHits), foe: String(foe.chargedHits) },
+        { label: '制胜分', me: String(me.winners), foe: String(foe.winners) },
+        { label: 'ACE', me: String(me.aces), foe: String(foe.aces) },
+        { label: '失误', me: String(me.errors + me.doubleFaults), foe: String(foe.errors + foe.doubleFaults) },
+        {
+          label: '最快球速',
+          me: me.topSpeed ? `${speedKmh(me.topSpeed)}` : '–',
+          foe: foe.topSpeed ? `${speedKmh(foe.topSpeed)}` : '–',
+        },
+      ],
+    };
     window.setTimeout(() => {
-      if (this.mode !== 'finished') return;
+      if (this.mode !== 'finished' || !this.summary) return;
       this.hud.setVisible(false);
-      this.menus.showResult({
-        won: winner === NEAR,
-        points: w.points,
-        difficulty: this.difficulty,
-        rows,
-      });
+      this.menus.showResult(this.summary);
     }, 900);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Replays
+  // ---------------------------------------------------------------------------
+
+  private storeClip(clip: ReplayClip): void {
+    this.lastClip = clip;
+    if (!this.bestClip || clip.excitement >= this.bestClip.excitement) this.bestClip = clip;
+  }
+
+  private buildPendingClip(): ReplayClip | null {
+    if (!this.pointPending) return this.lastClip;
+    this.pointPending = false;
+    const clip = this.recorder.buildClip();
+    if (clip) this.storeClip(clip);
+    return clip;
+  }
+
+  private replayCurrentPoint(): void {
+    if (this.mode !== 'playing') return;
+    const clip = this.buildPendingClip();
+    if (clip) this.startReplay(clip, 'play');
+  }
+
+  private startReplay(clip: ReplayClip, after: AfterReplay): void {
+    this.closeReplay();
+    const director = new ReplayDirector(clip);
+    this.replay = { clip, director, time: clip.start, nextEvent: 0, keys: clip.keyTimes(), after };
+    while (
+      this.replay.nextEvent < clip.events.length &&
+      clip.events[this.replay.nextEvent].t < clip.start
+    ) {
+      this.replay.nextEvent++;
+    }
+    this.mode = 'replay';
+    this.pointsSinceReplay = 0;
+    this.input.setEnabled(false);
+    this.menus.hide();
+    this.hud.setVisible(false);
+    this.hud.setChargeLevel(0);
+    this.hud.setReplayButton(false);
+    this.hud.showReplay(director.lineCall);
+    this.audio.setCharge(0);
+    this.audio.setSlowMotion(true);
+    this.audio.setCrowdMood('silent');
+    this.view.setReplayMode(true);
+
+    // Let the bodies settle into the first pose before the picture appears.
+    clip.sample(clip.start, this.frameState);
+    this.view.resetTrail(this.frameState);
+    for (let i = 0; i < 12; i++) this.view.updateScene(this.frameState, 1 / 60);
+  }
+
+  private closeReplay(): void {
+    if (!this.replay) return;
+    this.replay = null;
+    this.hud.hideReplay();
+    this.audio.setSlowMotion(false);
+    this.view.setReplayMode(false);
+  }
+
+  private finishReplay(): void {
+    const session = this.replay;
+    if (!session) return;
+    this.closeReplay();
+    readWorldFrame(this.world, 1, this.frameState);
+    this.view.resetTrail(this.frameState);
+    this.lastFrame = 0;
+    switch (session.after) {
+      case 'play':
+        this.world.skipPointDelay();
+        this.mode = 'playing';
+        this.hud.setVisible(true);
+        this.audio.setCrowdMood('idle');
+        this.input.setEnabled(true);
+        break;
+      case 'pause':
+        this.mode = 'paused';
+        this.hud.setVisible(true);
+        this.menus.showPause(this.audio.muted, this.autoReplay, this.lastClip !== null);
+        break;
+      case 'result':
+        this.mode = 'finished';
+        this.audio.setCrowdMood('idle');
+        if (this.summary) this.menus.showResult(this.summary);
+        break;
+    }
+  }
+
+  private advanceReplay(dt: number, draw: boolean): void {
+    const session = this.replay;
+    if (!session) return;
+    const { clip } = session;
+    const lastKey = session.keys[session.keys.length - 1] ?? clip.end;
+    const rate = this.reducedMotion ? 0.6 : replayRate(session.time, session.keys, lastKey);
+    const step = dt * rate;
+    session.time += step;
+
+    while (session.nextEvent < clip.events.length && clip.events[session.nextEvent].t <= session.time) {
+      this.playReplayEvent(clip.events[session.nextEvent].event, rate);
+      session.nextEvent++;
+    }
+
+    clip.sample(Math.min(session.time, clip.end), this.frameState);
+    this.view.updateScene(this.frameState, step);
+    this.view.updateReplayCamera(session.director, session.time, this.frameState, dt);
+    this.hud.setReplayProgress(clamp01((session.time - clip.start) / clip.duration));
+    if (draw) this.view.render();
+    if (session.time >= clip.end) this.finishReplay();
+  }
+
+  private playReplayEvent(event: GameEvent, rate: number): void {
+    this.view.onEvent(event, null);
+    const pitch = 0.55 + rate * 0.5;
+    switch (event.type) {
+      case 'hit':
+        this.audio.hit({
+          shot: event.shot,
+          quality: event.quality,
+          speed: event.speed,
+          x: event.x,
+          z: 8,
+          charge: event.charge,
+          rate: pitch,
+        });
+        break;
+      case 'bounce':
+        this.audio.bounce(event.speed, event.x, 8, pitch);
+        break;
+      case 'net':
+        this.audio.net(pitch);
+        break;
+      case 'swing':
+        this.audio.swing(0.8, 0, 8, pitch);
+        break;
+      default:
+        break;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -282,25 +502,84 @@ export class Game {
   };
 
   private advance(dt: number, draw: boolean): void {
+    if (this.mode === 'replay') {
+      this.advanceReplay(dt, draw);
+      return;
+    }
     const running = this.mode !== 'paused';
+    let simDt = 0;
     if (running) {
       let scale = 1;
       if (this.hitStop > 0) {
         this.hitStop -= dt;
         scale = 0.07;
       }
-      this.accumulator += dt * scale;
+      simDt = dt * scale;
+      this.accumulator += simDt;
       while (this.accumulator >= TICK) {
         this.accumulator -= TICK;
         this.tick();
+        // A replay can begin in the middle of a batch of ticks.
+        if ((this.mode as Mode) === 'replay') return;
       }
-      this.view.footDust(this.world);
     }
 
-    const human = this.mode === 'menu' ? null : NEAR;
-    this.view.update(this.world, this.accumulator / TICK, running ? dt : 0, human);
-    if (this.mode === 'playing') this.updateHint();
+    readWorldFrame(this.world, this.accumulator / TICK, this.frameState);
+    if (running) this.view.footDust(this.frameState);
+    this.view.updateScene(this.frameState, running ? simDt : 0);
+    if (this.mode === 'menu') this.view.updateAttractCamera(dt);
+    else this.view.updateLiveCamera(this.world, this.frameState, NEAR, dt);
+
+    if (this.mode === 'playing') {
+      this.updateHint();
+      this.updateCharging();
+      this.updateFootsteps(simDt);
+      this.maybeStartReplay();
+    }
     if (draw) this.view.render();
+  }
+
+  private updateCharging(): void {
+    const level = this.frameState.players[NEAR].chargeLevel;
+    this.audio.setCharge(level);
+    this.hud.setChargeLevel(level);
+  }
+
+  private updateFootsteps(dt: number): void {
+    this.squeakCooldown -= dt;
+    if (dt <= 0) return;
+    for (const side of [NEAR, FAR] as const) {
+      const p = this.frameState.players[side];
+      const speed = Math.hypot(p.vel.x, p.vel.z);
+      const level = side === NEAR ? 1 : 0.55;
+      if (p.onGround && speed > 1.5) {
+        this.stepClock[side] += (speed * dt) / 1.45;
+        if (this.stepClock[side] >= 1) {
+          this.stepClock[side] -= 1;
+          this.audio.step(p.pos.x, p.pos.z, level);
+        }
+      }
+      const last = this.lastVel[side];
+      const accel = Math.hypot(p.vel.x - last.x, p.vel.z - last.z) / dt;
+      last.x = p.vel.x;
+      last.z = p.vel.z;
+      if (p.onGround && accel > 30 && speed > 2 && this.squeakCooldown <= 0 && Math.random() < 0.3) {
+        this.squeakCooldown = 0.5;
+        this.audio.squeak(p.pos.x, p.pos.z, level * clamp01(speed / 5));
+      }
+    }
+  }
+
+  private maybeStartReplay(): void {
+    const w = this.world;
+    if (!this.pointPending || w.phase !== 'dead' || w.phaseTime < REPLAY_DELAY) return;
+    const clip = this.buildPendingClip();
+    this.hud.setReplayButton(clip !== null);
+    if (!clip) return;
+    this.pointsSinceReplay++;
+    const special = clip.point.matchPoint;
+    const worthy = clip.excitement >= AUTO_REPLAY_SCORE && this.pointsSinceReplay >= 2;
+    if (this.autoReplay && (special || worthy)) this.startReplay(clip, 'play');
   }
 
   private nearIntent(): PlayerIntent {
@@ -320,7 +599,12 @@ export class Game {
     const near = this.nearIntent();
     const far = this.ais[FAR].update(w);
     w.step([near, far]);
-    for (const event of w.drainEvents()) this.handleEvent(event);
+    const recording = this.mode === 'playing';
+    if (recording) this.recorder.capture(w);
+    for (const event of w.drainEvents()) {
+      if (recording) this.recorder.note(event);
+      this.handleEvent(event);
+    }
   }
 
   private refreshScore(): void {
@@ -337,17 +621,25 @@ export class Game {
   private updateHint(): void {
     const w = this.world;
     const touch = this.input.mode === 'touch';
-    let hint: string | null = null;
+    const me = w.players[NEAR];
     const serving = w.server === NEAR;
+    let hint: string | null = null;
     if (w.phase === 'ready' && serving) {
-      if (touch) hint = '点右半屏抛球';
-      else hint = this.tutorialDone ? '点击抛球' : '移动鼠标选落点，点击抛球';
+      if (touch) hint = this.tutorialDone ? '点右半屏抛球' : '点右半屏抛球，按住可蓄力';
+      else hint = this.tutorialDone ? '点击抛球' : '移动鼠标选落点，点击抛球，按住可蓄力';
     } else if (w.phase === 'toss' && serving) {
-      hint = touch ? '光环收拢时点右半屏发球' : '光环收拢时点击发球';
+      if (me.chargeTime >= 0) hint = touch ? '光环收拢时松手发球' : '光环收拢时松开发球';
+      else hint = touch ? '光环收拢时点右半屏发球' : '光环收拢时点击发球';
+    } else if (me.chargeLevel > 0) {
+      hint = me.chargeLevel >= 1 ? '蓄力已满，收拢时松开' : '蓄力中，收拢时松开';
     } else if (!this.tutorialDone) {
       if (w.phase === 'ready') hint = '准备接发球';
       else if (w.isIncoming(NEAR)) {
         hint = touch ? '跑到黄圈附近，光环收拢时点右半屏' : 'WASD 跑到黄圈附近，光环收拢时点击';
+        const coming = w.crossing(NEAR);
+        if (coming && coming.t > 0.62 && w.rally >= 3) {
+          hint = touch ? '来得及时，提前按住右侧可蓄力' : '来得及时，提前按住左键可蓄力';
+        }
       }
     }
     const crossing = w.crossing(NEAR);
@@ -367,7 +659,7 @@ export class Game {
   // Reacting to what happened on court
   // ---------------------------------------------------------------------------
 
-  private popupAt(text: string, x: number, y: number, z: number, tone: 'perfect' | 'good' | 'miss' | 'speed'): void {
+  private popupAt(text: string, x: number, y: number, z: number, tone: PopupTone): void {
     const p = this.view.toScreen(x, y, z);
     this.hud.popup(text, p.x, p.y, tone);
   }
@@ -376,15 +668,23 @@ export class Game {
     const w = this.world;
     const playing = this.mode === 'playing';
     const human = this.mode === 'menu' ? null : NEAR;
-    this.view.onEvent(event, w, human);
+    this.view.onEvent(event, human);
 
     switch (event.type) {
       case 'hit': {
-        const power = clamp01((event.speed - 12) / 24);
         const perfect = event.timing === 'perfect';
-        this.audio.hit(power, event.x, event.z, perfect);
+        this.audio.hit({
+          shot: event.shot,
+          quality: event.quality,
+          speed: event.speed,
+          x: event.x,
+          z: event.z,
+          charge: event.charge,
+        });
+        if (playing) this.audio.setCrowdMood('silent');
         if (!this.reducedMotion) {
-          if (event.shot === 'smash') this.hitStop = 0.09;
+          if (event.charge > 0.2) this.hitStop = 0.08 + event.charge * 0.06;
+          else if (event.shot === 'smash') this.hitStop = 0.09;
           else if (perfect && event.side === NEAR && playing) this.hitStop = 0.05;
         }
         if (!playing) break;
@@ -393,15 +693,19 @@ export class Game {
           const tone = perfect ? 'perfect' : event.timing === 'good' ? 'good' : 'miss';
           this.popupAt(TIMING_TEXT[event.timing], event.x, event.y + 0.45, event.z, tone);
         }
-        if (event.shot === 'serve' || event.shot === 'smash') {
-          const label = `${speedKmh(event.speed)} km/h`;
-          this.popupAt(label, event.x, event.y + 0.95, event.z, 'speed');
+        if (event.charge > 0.2) {
+          const label = event.charge >= 1 ? '满蓄力！' : '蓄力球！';
+          this.popupAt(label, event.x, event.y + 1.05, event.z, 'power');
+        } else if (event.shot === 'serve' || event.shot === 'smash') {
+          this.popupAt(`${speedKmh(event.speed)} km/h`, event.x, event.y + 0.95, event.z, 'speed');
         }
         break;
       }
-      case 'swing':
-        if (event.side === NEAR && this.mode !== 'menu') this.audio.swing();
+      case 'swing': {
+        const p = w.players[event.side];
+        if (this.mode !== 'menu') this.audio.swing(event.side === NEAR ? 1 : 0.6, p.pos.x, p.pos.z);
         break;
+      }
       case 'whiff':
         if (event.side === NEAR && playing) {
           const p = w.players[NEAR].pos;
@@ -410,12 +714,20 @@ export class Game {
         break;
       case 'toss':
         this.audio.toss();
+        if (playing) this.audio.setCrowdMood('silent');
         break;
       case 'jump':
-        if (event.side === NEAR && playing) this.audio.jump();
+        if (playing) this.audio.step(event.x, event.z, 1.2);
+        break;
+      case 'land':
+        if (playing) this.audio.step(event.x, event.z, 1.6);
+        break;
+      case 'charge-full':
+        if (event.side === NEAR && playing) this.audio.chargeReady();
         break;
       case 'bounce':
         this.audio.bounce(event.speed, event.x, event.z);
+        if (playing && event.live && event.isIn && event.margin < 0.22) this.audio.ooh(0.5);
         break;
       case 'net':
         this.audio.net();
@@ -434,8 +746,13 @@ export class Game {
       case 'serve-ready':
         if (playing) {
           this.hud.setRally(0);
+          this.hud.setReplayButton(false);
+          this.pointPending = false;
+          this.audio.setCrowdMood('hushed');
           this.refreshScore();
         }
+        readWorldFrame(w, 1, this.frameState);
+        this.view.resetCourt(this.frameState);
         break;
       case 'match-end':
         if (this.mode !== 'menu') this.onMatchEnd(event.winner);
@@ -447,20 +764,27 @@ export class Game {
 
   private onPoint(event: Extract<GameEvent, { type: 'point' }>): void {
     const great = event.reason === 'winner' || event.reason === 'ace' || event.rally >= 8;
-    this.audio.cheer(great ? 0.9 : 0.45);
+    const humanWon = event.winner === NEAR;
+    if (this.mode === 'menu') {
+      this.audio.applause(great ? 0.42 : 0.26);
+      return;
+    }
+    this.audio.setCrowdMood('idle');
+    this.audio.applause(great ? (humanWon ? 0.95 : 0.7) : humanWon ? 0.5 : 0.34);
+    if (great && humanWon) this.audio.cheer(event.matchPoint ? 1 : 0.75);
+    else if (!great && !humanWon && event.rally >= 4) this.audio.groan(0.5);
     if (this.mode !== 'playing') return;
+
+    this.pointPending = true;
+    this.hud.setReplayButton(true);
     this.refreshScore();
-    const won = event.winner === NEAR;
-    if (won) this.audio.pointWon();
-    else this.audio.pointLost();
     const sub = event.rally >= 6 ? `${event.rally} 拍回合` : '';
-    this.hud.flash(won ? WIN_TEXT[event.reason] : LOSE_TEXT[event.reason], won ? 'win' : 'lose', sub);
+    this.hud.flash(humanWon ? WIN_TEXT[event.reason] : LOSE_TEXT[event.reason], humanWon ? 'win' : 'lose', sub);
   }
 
   private onMatchEnd(winner: 0 | 1): void {
-    if (winner === NEAR) this.audio.matchWon();
-    else this.audio.matchLost();
-    this.audio.cheer(1);
+    this.audio.cheer(winner === NEAR ? 1 : 0.5);
+    this.audio.applause(1);
     if (this.mode === 'playing') this.finishMatch(winner);
   }
 
@@ -470,6 +794,11 @@ export class Game {
       mode: this.mode,
       world: this.world,
       input: this.input,
+      frame: this.frameState,
+      lastClip: this.lastClip,
+      bestClip: this.bestClip,
+      replay: this.replay,
+      audio: this.audio,
     };
   }
 

@@ -29,6 +29,8 @@ export interface PlayerIntent {
   /** Edge-triggered: true only on the tick the button was pressed. */
   jump: boolean;
   swing: boolean;
+  /** True while the swing button is down. Pressing early and holding charges a shot. */
+  held: boolean;
   /** Hit a lob instead of a drive. Read at the moment of contact. */
   lob: boolean;
   /** -1 (towards -x) .. 1 (towards +x). */
@@ -44,6 +46,7 @@ export const emptyIntent = (): PlayerIntent => ({
   moveZ: 0,
   jump: false,
   swing: false,
+  held: false,
   lob: false,
   aimU: 0,
   aimV: 0.7,

@@ -32,6 +32,8 @@ export interface AIProfile {
   judgement: number;
   serveU: number;
   serveV: number;
+  /** Chance of winding up a power shot when there is time for one. */
+  chargeChance: number;
 }
 
 export const AI_PROFILES: Record<Difficulty, AIProfile> = {
@@ -53,6 +55,7 @@ export const AI_PROFILES: Record<Difficulty, AIProfile> = {
     judgement: 0.35,
     serveU: 0.3,
     serveV: 0.62,
+    chargeChance: 0.05,
   },
   normal: {
     reaction: 0.25,
@@ -72,6 +75,7 @@ export const AI_PROFILES: Record<Difficulty, AIProfile> = {
     judgement: 0.7,
     serveU: 0.55,
     serveV: 0.76,
+    chargeChance: 0.13,
   },
   hard: {
     reaction: 0.16,
@@ -91,6 +95,7 @@ export const AI_PROFILES: Record<Difficulty, AIProfile> = {
     judgement: 0.95,
     serveU: 0.78,
     serveV: 0.9,
+    chargeChance: 0.24,
   },
 };
 
@@ -123,6 +128,9 @@ export class AIController {
   private noiseX = 0;
   private noiseZ = 0;
   private serveDelay = 1;
+  private wantCharge = false;
+  private charging = false;
+  private chargeServe = false;
 
   constructor(
     readonly side: Side,
@@ -136,6 +144,7 @@ export class AIController {
     const intent = this.intent;
     const me = world.players[this.side];
     intent.swing = false;
+    intent.held = false;
     intent.jump = false;
     intent.moveX = 0;
     intent.moveZ = 0;
@@ -143,11 +152,16 @@ export class AIController {
     switch (world.phase) {
       case 'ready':
         this.prepareServe(world);
-        if (world.server === this.side && world.phaseTime >= this.serveDelay) intent.swing = true;
+        if (world.server === this.side && world.phaseTime >= this.serveDelay) {
+          intent.swing = true;
+          intent.held = this.chargeServe;
+        }
         break;
       case 'toss':
-        if (world.server === this.side && world.tossTime >= IDEAL_TOSS_TIME + this.plannedError) {
-          intent.swing = true;
+        if (world.server === this.side) {
+          const due = world.tossTime >= IDEAL_TOSS_TIME + this.plannedError;
+          if (this.chargeServe) intent.held = !due;
+          else if (due) intent.swing = true;
         }
         break;
       case 'serve':
@@ -166,6 +180,7 @@ export class AIController {
     if (world.server !== this.side) return;
     const { rng, profile, intent } = this;
     const second = world.serveNumber === 2;
+    this.chargeServe = !second && rng() < profile.chargeChance;
     this.serveDelay = lerp(0.9, 1.5, rng());
     this.plannedError = gaussian(rng) * profile.timingSigma * 1.35;
     const edge = rng() < 0.5 ? -1 : 1;
@@ -179,6 +194,8 @@ export class AIController {
     const { rng, profile } = this;
     const ball = world.ball;
     this.seenHit = world.hitId;
+    this.wantCharge = rng() < profile.chargeChance;
+    this.charging = false;
     // A serve is expected, so the returner is already on their toes.
     const anticipation = world.phase === 'serve' ? 0.5 : 1;
     this.react = profile.reaction * anticipation * lerp(0.85, 1.15, rng());
@@ -231,9 +248,33 @@ export class AIController {
       if (extra < 1 && crossing.t <= 0.3) this.intent.jump = true;
     }
 
-    if (this.pressedFor === world.hitId || !world.canSwing(this.side)) return;
     const onTime = crossing !== null && crossing.reachable && crossing.t <= SWING.lead - this.plannedError;
-    if (onTime || (crossing === null && world.ballInReach(this.side))) {
+    const late = crossing === null && world.ballInReach(this.side);
+
+    if (this.charging) {
+      if (onTime || late) {
+        this.charging = false;
+        this.pressedFor = world.hitId;
+        this.chooseShot(world, me);
+      } else {
+        this.intent.held = true;
+      }
+      return;
+    }
+
+    if (this.pressedFor === world.hitId || !world.canSwing(this.side)) return;
+
+    if (this.wantCharge && crossing && crossing.reachable) {
+      const settled = Math.hypot(this.targetX - me.pos.x, this.targetZ - me.pos.z) < 0.7;
+      if (settled && crossing.t > SWING.lead + SWING.earlyWindow + 0.1) {
+        this.charging = true;
+        this.intent.swing = true;
+        this.intent.held = true;
+        return;
+      }
+    }
+
+    if (onTime || late) {
       this.pressedFor = world.hitId;
       this.intent.swing = true;
       this.chooseShot(world, me);

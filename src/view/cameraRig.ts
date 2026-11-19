@@ -19,14 +19,18 @@ const FAR_POINTS: [number, number, number][] = [
  */
 export class CameraRig {
   readonly camera = new PerspectiveCamera(40, 1, 1, 460);
+  /** Set to 0 for players who prefer reduced motion. */
+  motion = 1;
   private readonly basePos = new Vector3();
   private readonly baseTarget = new Vector3();
   private readonly look = new Vector3();
   private readonly probe = new Vector3();
+  private baseFov = 40;
   private follow = 0.42;
   private offsetX = 0;
   private offsetZ = 0;
   private trauma = 0;
+  private kick = 0;
   private time = 0;
 
   private project(x: number, y: number, z: number): Vector3 {
@@ -67,7 +71,8 @@ export class CameraRig {
     const t = clamp01((aspect - 0.55) / (1.7 - 0.55));
     const c = this.camera;
     c.aspect = aspect;
-    c.fov = lerp(46, 34, t);
+    this.baseFov = lerp(46, 34, t);
+    c.fov = this.baseFov;
     c.updateProjectionMatrix();
     const pitch = MathUtils.degToRad(lerp(39, 25, t));
     // Keep the far player below the scoreboard, which matters on short screens.
@@ -89,7 +94,20 @@ export class CameraRig {
   }
 
   shake(amount: number): void {
-    this.trauma = Math.min(1, this.trauma + amount);
+    this.trauma = Math.min(1, this.trauma + amount * this.motion);
+  }
+
+  /** A brief zoom that sells the weight of a power shot. */
+  punch(amount: number): void {
+    this.kick = Math.max(this.kick, amount * this.motion);
+  }
+
+  private setFov(fov: number): void {
+    const c = this.camera;
+    if (Math.abs(c.fov - fov) > 0.01) {
+      c.fov = fov;
+      c.updateProjectionMatrix();
+    }
   }
 
   /** Follows the human player gently, so the court itself stays readable. */
@@ -102,6 +120,7 @@ export class CameraRig {
     this.offsetZ += (targetZ - this.offsetZ) * (1 - Math.exp(-9 * dt));
 
     this.trauma = Math.max(0, this.trauma - dt * 2.4);
+    this.kick = Math.max(0, this.kick - dt * 3.4);
     const shake = this.trauma * this.trauma;
     const sx = Math.sin(this.time * 47) * shake * 0.34;
     const sy = Math.sin(this.time * 61 + 1.3) * shake * 0.26;
@@ -110,6 +129,16 @@ export class CameraRig {
     c.position.set(this.basePos.x + this.offsetX + sx, this.basePos.y + sy, this.basePos.z + this.offsetZ);
     this.look.set(this.baseTarget.x + this.offsetX * 0.7, this.baseTarget.y, this.baseTarget.z + this.offsetZ * 0.6);
     c.lookAt(this.look);
+    this.setFov(this.baseFov * (1 - this.kick * this.kick * 0.11));
+    c.updateMatrixWorld(true);
+  }
+
+  /** Puts the camera exactly where a replay shot wants it. */
+  setDirected(px: number, py: number, pz: number, tx: number, ty: number, tz: number, fov: number): void {
+    const c = this.camera;
+    c.position.set(px, py, pz);
+    c.lookAt(tx, ty, tz);
+    this.setFov(fov);
     c.updateMatrixWorld(true);
   }
 }

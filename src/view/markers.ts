@@ -184,7 +184,8 @@ export class Markers {
     const k = clamp01(remaining / 0.7);
     this.timingOuter.scale.set(1 + k * 1.5, 1, 1 + k * 1.5);
     const onBeat = Math.abs(remaining) < 0.05;
-    this.timingOuterMat.color.setHex(!good ? 0xff9f43 : onBeat ? 0xffffff : 0xd9f84a);
+    const charging = world.players[human].chargeLevel > 0;
+    this.timingOuterMat.color.setHex(!good ? 0xff9f43 : onBeat ? 0xffffff : charging ? 0xffc53d : 0xd9f84a);
     this.timingOuterMat.opacity = 0.4 + (1 - k) * 0.6;
     this.timingInnerMat.opacity = onBeat ? 0.95 : 0.42;
     this.timingInnerMat.color.setHex(good ? 0xffffff : 0xffc78a);

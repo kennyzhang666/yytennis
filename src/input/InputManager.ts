@@ -28,6 +28,7 @@ export class InputManager {
   private swingQueued = false;
   private jumpQueued = false;
   private rightClickLob = false;
+  private mouseHeld = false;
   private aimU = 0;
   private aimV = 0.72;
 
@@ -51,6 +52,8 @@ export class InputManager {
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.clearHeld);
     window.addEventListener('pointermove', this.onPointerMove, { passive: true });
+    window.addEventListener('pointerup', this.onPointerUp);
+    window.addEventListener('pointercancel', this.onPointerUp);
     canvas.addEventListener('pointerdown', this.onCanvasDown);
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   }
@@ -78,7 +81,12 @@ export class InputManager {
     this.keys.clear();
     this.swingQueued = false;
     this.jumpQueued = false;
+    this.mouseHeld = false;
     this.touch.reset();
+  };
+
+  private readonly onPointerUp = (e: PointerEvent): void => {
+    if (e.pointerType === 'mouse') this.mouseHeld = false;
   };
 
   // KeyboardEvent.code is the physical key, so WASD keeps working while a
@@ -124,7 +132,14 @@ export class InputManager {
     e.preventDefault();
     this.setMode('mouse');
     this.rightClickLob = e.button === 2;
+    this.mouseHeld = true;
     this.queueSwing();
+    try {
+      // Keeps the release visible even if the cursor leaves the window.
+      this.canvas.setPointerCapture(e.pointerId);
+    } catch {
+      // Synthetic or already-ended pointers cannot be captured.
+    }
   }
 
   /** Reads the current input. Button presses are delivered exactly once. */
@@ -138,11 +153,13 @@ export class InputManager {
     if (!this.enabled) {
       i.moveX = 0;
       i.moveZ = 0;
+      i.held = false;
       return i;
     }
 
     if (this.mode === 'touch') {
       const t = this.touch;
+      i.held = t.swingHeld;
       i.moveX = t.moveX;
       i.moveZ = t.moveY;
       i.aimU = t.aimU;
@@ -153,6 +170,7 @@ export class InputManager {
     }
 
     const k = this.keys;
+    i.held = this.mouseHeld;
     i.moveX =
       (k.has('KeyD') || k.has('ArrowRight') ? 1 : 0) - (k.has('KeyA') || k.has('ArrowLeft') ? 1 : 0);
     i.moveZ = (k.has('KeyS') || k.has('ArrowDown') ? 1 : 0) - (k.has('KeyW') || k.has('ArrowUp') ? 1 : 0);

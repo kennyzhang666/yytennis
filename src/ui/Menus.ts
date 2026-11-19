@@ -12,6 +12,7 @@ export interface MatchSummary {
   points: readonly [number, number];
   difficulty: Difficulty;
   rows: { label: string; me: string; foe: string }[];
+  hasHighlight: boolean;
 }
 
 export interface MenuHandlers {
@@ -20,6 +21,9 @@ export interface MenuHandlers {
   onRestart(): void;
   onHome(): void;
   onToggleSound(): boolean;
+  onToggleAutoReplay(): boolean;
+  onReplayLast(): void;
+  onHighlight(): void;
   onClick(): void;
 }
 
@@ -29,11 +33,13 @@ const CONTROLS: Record<InputMode, [string, string][]> = {
     ['空格', '跳跃'],
     ['鼠标', '选落点'],
     ['左键', '击球 / 发球'],
+    ['按住左键', '蓄力，松开击球'],
     ['右键', '放高球'],
   ],
   touch: [
     ['左摇杆', '移动'],
     ['右侧轻点', '击球'],
+    ['右侧按住', '蓄力'],
     ['右侧滑动', '选方向'],
     ['右侧下滑', '高球'],
     ['箭头', '跳跃'],
@@ -59,6 +65,8 @@ export class Menus {
   private readonly result: HTMLElement;
   private readonly controls: HTMLElement;
   private readonly soundBtn: HTMLButtonElement;
+  private readonly autoReplayBtn: HTMLButtonElement;
+  private readonly replayBtn: HTMLButtonElement;
 
   constructor(
     parent: HTMLElement,
@@ -90,11 +98,15 @@ export class Menus {
         </div>
       </section>
       <section class="screen screen-center screen-pause" hidden>
-        <div class="panel small-panel">
+        <div class="panel small-panel pause-panel">
           <h2>已暂停</h2>
           <button class="btn btn-primary" type="button" data-action="resume">继续比赛</button>
+          <button class="btn" type="button" data-action="replay-last">回放上一分</button>
           <button class="btn" type="button" data-action="restart">重新开始</button>
-          <button class="btn" type="button" data-action="sound"></button>
+          <div class="toggle-row">
+            <button class="btn" type="button" data-action="sound"></button>
+            <button class="btn" type="button" data-action="auto-replay"></button>
+          </div>
           <button class="btn btn-quiet" type="button" data-action="home">回到主菜单</button>
         </div>
       </section>
@@ -108,6 +120,8 @@ export class Menus {
     this.result = this.root.querySelector('.screen-result') as HTMLElement;
     this.controls = this.root.querySelector('.controls') as HTMLElement;
     this.soundBtn = this.root.querySelector('[data-action="sound"]') as HTMLButtonElement;
+    this.autoReplayBtn = this.root.querySelector('[data-action="auto-replay"]') as HTMLButtonElement;
+    this.replayBtn = this.root.querySelector('[data-action="replay-last"]') as HTMLButtonElement;
     this.root.addEventListener('click', this.onClick);
     this.renderDifficulty();
     this.renderControls();
@@ -145,6 +159,15 @@ export class Menus {
       case 'sound':
         this.setSoundLabel(this.handlers.onToggleSound());
         break;
+      case 'auto-replay':
+        this.setAutoReplayLabel(this.handlers.onToggleAutoReplay());
+        break;
+      case 'replay-last':
+        this.handlers.onReplayLast();
+        break;
+      case 'highlight':
+        this.handlers.onHighlight();
+        break;
       default:
         break;
     }
@@ -169,6 +192,11 @@ export class Menus {
     this.soundBtn.setAttribute('aria-pressed', String(!muted));
   }
 
+  private setAutoReplayLabel(on: boolean): void {
+    this.autoReplayBtn.textContent = on ? '自动回放：开' : '自动回放：关';
+    this.autoReplayBtn.setAttribute('aria-pressed', String(on));
+  }
+
   setInputMode(mode: InputMode): void {
     this.mode = mode;
     this.renderControls();
@@ -187,9 +215,11 @@ export class Menus {
     this.root.classList.add('is-open');
   }
 
-  showPause(muted: boolean): void {
+  showPause(muted: boolean, autoReplay: boolean, canReplay: boolean): void {
     this.hide();
     this.setSoundLabel(muted);
+    this.setAutoReplayLabel(autoReplay);
+    this.replayBtn.hidden = !canReplay;
     this.pause.hidden = false;
     this.root.classList.add('is-open');
   }
@@ -211,6 +241,7 @@ export class Menus {
         <tbody>${rows}</tbody>
       </table>
       <button class="btn btn-primary" type="button" data-action="restart">再来一局</button>
+      ${summary.hasHighlight ? '<button class="btn" type="button" data-action="highlight">看精彩回放</button>' : ''}
       <button class="btn btn-quiet" type="button" data-action="home">回到主菜单</button>`;
     this.result.hidden = false;
     this.root.classList.add('is-open');

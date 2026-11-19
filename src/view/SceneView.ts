@@ -9,17 +9,20 @@ import {
   Vector3,
   WebGLRenderer,
 } from 'three';
-import { clamp, clamp01, lerp } from '../sim/math';
-import { FAR, NEAR, type Side, type Vec3 } from '../sim/types';
+import type { SceneFrame } from '../sim/frame';
+import { clamp, clamp01 } from '../sim/math';
+import { FAR, NEAR, otherSide, type Side, type Vec3 } from '../sim/types';
 import type { GameEvent, World } from '../sim/world';
 import { BallView } from './ballView';
 import { CameraRig } from './cameraRig';
 import { buildCourt } from './court';
 import { Effects } from './fx';
 import { GroundBlob, Markers } from './markers';
+import { LOOK_FAR, LOOK_NEAR } from './playerModel';
 import { PlayerRig } from './playerRig';
+import type { ReplayDirector } from './replayDirector';
 import { Stadium } from './stadium';
-import { blobTexture } from './textures';
+import { blobTexture, glowTexture } from './textures';
 
 export type QualityTier = 'high' | 'low';
 
@@ -36,12 +39,12 @@ export class SceneView {
   private readonly scene = new Scene();
   private readonly stadium: Stadium;
   private readonly rigs: [PlayerRig, PlayerRig];
-  private readonly playerShadows: [GroundBlob, GroundBlob];
+  private readonly contactShadows: [GroundBlob, GroundBlob];
   private readonly ball: BallView;
   private readonly markers = new Markers();
   private readonly fx: Effects;
-  private readonly ballPos: Vec3 = { x: 0, y: 1, z: 0 };
   private readonly projected = new Vector3();
+  private readonly racket: Vec3 = { x: 0, y: 0, z: 0 };
   private readonly maxPixelRatio: number;
   private resolutionStep: number;
   private frameTime = 1 / 60;
@@ -50,6 +53,7 @@ export class SceneView {
   private width = 1;
   private height = 1;
   private clock = 0;
+  private emberClock = 0;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -60,7 +64,7 @@ export class SceneView {
       antialias: true,
       alpha: false,
       powerPreference: 'high-performance',
-      stencil: false,
+      stencil: true,
     });
     this.renderer.outputColorSpace = SRGBColorSpace;
     this.renderer.toneMapping = NeutralToneMapping;
@@ -80,38 +84,21 @@ export class SceneView {
     this.scene.add(buildCourt(tier === 'low' ? 46 : 76, Math.min(anisotropy, tier === 'low' ? 6 : 12)));
 
     const blob = blobTexture();
-    this.playerShadows = [new GroundBlob(blob), new GroundBlob(blob)];
-    this.scene.add(this.playerShadows[0].mesh, this.playerShadows[1].mesh);
+    const glow = glowTexture();
+    this.contactShadows = [new GroundBlob(blob), new GroundBlob(blob)];
+    this.scene.add(this.contactShadows[0].mesh, this.contactShadows[1].mesh);
     const ballShadow = new GroundBlob(blob);
     this.scene.add(ballShadow.mesh);
 
     this.scene.add(this.markers.group);
-    this.fx = new Effects(blob);
+    this.fx = new Effects(blob, glow);
     this.scene.add(this.fx.group);
 
-    this.rigs = [
-      new PlayerRig(NEAR, {
-        shirt: 0xff5546,
-        trim: 0xffffff,
-        shorts: 0xf8f6f0,
-        skin: 0xf0bf98,
-        hat: 0xffffff,
-        shoe: 0xfdfdfd,
-        racket: 0x1d2a44,
-      }),
-      new PlayerRig(FAR, {
-        shirt: 0x7a55f2,
-        trim: 0xffd166,
-        shorts: 0x20264a,
-        skin: 0xc98f68,
-        hat: 0xffd166,
-        shoe: 0xf2f2f2,
-        racket: 0xffb703,
-      }),
-    ];
+    const detailed = tier === 'high';
+    this.rigs = [new PlayerRig(NEAR, LOOK_NEAR, detailed), new PlayerRig(FAR, LOOK_FAR, detailed)];
     this.scene.add(this.rigs[0].root, this.rigs[1].root);
 
-    this.ball = new BallView(ballShadow);
+    this.ball = new BallView(ballShadow, glow);
     this.scene.add(this.ball.group);
     this.resize();
   }
@@ -164,48 +151,52 @@ export class SceneView {
     return { x: ((p.x + 1) / 2) * this.width, y: ((1 - p.y) / 2) * this.height };
   }
 
-  update(world: World, alpha: number, dt: number, human: Side | null): void {
+  /** Poses everything on court from a live or replayed frame. */
+  updateScene(frame: SceneFrame, dt: number): void {
     this.clock += dt;
-
-    const b = world.ball;
-    this.ballPos.x = lerp(b.prevPos.x, b.pos.x, alpha);
-    this.ballPos.y = lerp(b.prevPos.y, b.pos.y, alpha);
-    this.ballPos.z = lerp(b.prevPos.z, b.pos.z, alpha);
-
-    let focusX = 0;
-    let focusZ = 12.6;
     for (const side of [NEAR, FAR] as const) {
-      const p = world.players[side];
-      const x = lerp(p.prevPos.x, p.pos.x, alpha);
-      const y = lerp(p.prevPos.y, p.pos.y, alpha);
-      const z = lerp(p.prevPos.z, p.pos.z, alpha);
-      const celebrating =
-        (world.phase === 'dead' && world.lastPointWinner === side && world.phaseTime > 0.25 && world.phaseTime < 1.45) ||
-        (world.phase === 'over' && world.winner === side);
-      this.rigs[side].update(p, x, y, z, this.ballPos, dt, celebrating);
-      const lift = 1 + y * 0.25;
-      this.playerShadows[side].place(x + 0.14 + y * 0.14, z - 0.06, 0.52 * lift, 0.42 * lift, 0.46 / (1 + y * 0.7));
-      if (side === human) {
-        focusX = x;
-        focusZ = z;
+      const p = frame.players[side];
+      this.rigs[side].update(p, dt);
+      const lift = 1 + p.pos.y * 0.6;
+      this.contactShadows[side].place(p.pos.x, p.pos.z, 0.34 * lift, 0.34 * lift, 0.26 / (1 + p.pos.y * 2));
+      this.rigs[side].racketHead(this.racket);
+      this.fx.setCharge(side, p.pos.x, p.pos.z, p.chargeLevel, this.racket, dt);
+    }
+
+    this.ball.update(frame.ball, this.rig.camera, dt);
+    if (frame.ball.charge > 0.2 && !frame.ball.held) {
+      this.emberClock += dt * (20 + frame.ball.charge * 60);
+      while (this.emberClock >= 1) {
+        this.emberClock -= 1;
+        this.fx.ember(frame.ball.pos, frame.ball.charge);
       }
     }
-
-    this.ball.update(b, this.ballPos, this.rig.camera, dt);
     this.fx.update(dt);
     this.stadium.update(dt);
-
-    if (human === null) {
-      this.markers.hideAll();
-      this.rig.update(0, 12.6, dt, Math.sin(this.clock * 0.16) * 2.2);
-    } else {
-      const me = world.players[human];
-      this.markers.update(world, human, lerp(me.prevPos.x, me.pos.x, alpha), lerp(me.prevPos.z, me.pos.z, alpha), dt);
-      this.rig.update(focusX, focusZ, dt, 0);
-    }
   }
 
-  onEvent(event: GameEvent, world: World, human: Side | null): void {
+  updateLiveCamera(world: World, frame: SceneFrame, human: Side, dt: number): void {
+    const me = frame.players[human];
+    this.markers.update(world, human, me.pos.x, me.pos.z, dt);
+    this.rig.update(me.pos.x, me.pos.z, dt, 0);
+  }
+
+  updateAttractCamera(dt: number): void {
+    this.markers.hideAll();
+    this.rig.update(0, 12.6, dt, Math.sin(this.clock * 0.16) * 2.2);
+  }
+
+  updateReplayCamera(director: ReplayDirector, time: number, frame: SceneFrame, dt: number): void {
+    this.markers.hideAll();
+    director.apply(time, frame, this.rig, dt);
+  }
+
+  setReplayMode(on: boolean): void {
+    this.stadium.setReplayMode(on);
+    this.fx.clearScuffs();
+  }
+
+  onEvent(event: GameEvent, human: Side | null): void {
     switch (event.type) {
       case 'hit': {
         const power = clamp01((event.speed - 12) / 24);
@@ -221,13 +212,18 @@ export class SceneView {
           color,
         });
         this.ball.setTrailColor(smash ? 0xffa45c : perfect ? 0xfff58a : 0xe9ff7a);
-        if (smash) this.rig.shake(0.72);
+        this.rigs[otherSide(event.side)].splitStep();
+        if (event.charge > 0.2) {
+          const distance = this.rig.camera.position.distanceTo(this.projected.set(event.x, event.y, event.z));
+          this.fx.powerHit(event.x, event.y, event.z, event.charge, clamp(distance / 24, 0.28, 1.1));
+          this.rig.shake(0.5 + event.charge * 0.5);
+          this.rig.punch(event.charge);
+        } else if (smash) this.rig.shake(0.72);
         else if (event.shot === 'serve' && perfect) this.rig.shake(0.34);
         else if (perfect && event.side === human) this.rig.shake(0.2);
         break;
       }
       case 'bounce': {
-        const v = world.ball.vel;
         const out = event.live && !event.isIn;
         this.fx.burst(event.x, 0.04, event.z, {
           count: clamp(Math.round(event.speed * 0.45), 3, 10),
@@ -239,7 +235,11 @@ export class SceneView {
           gravity: 3,
         });
         this.fx.pulse(event.x, event.z, out ? 0xff5a4f : 0xffffff, out ? 1.25 : 0.62, out ? 0.6 : 0.34);
-        if (event.live) this.fx.scuff(event.x, event.z, v.x, v.z, out ? 0xff4f42 : 0xe4f1ff);
+        if (event.live) this.fx.scuff(event.x, event.z, event.vx, event.vz, out ? 0xff4f42 : 0xe4f1ff);
+        if (event.charge > 0.2) {
+          this.fx.powerBounce(event.x, event.z, event.vx, event.vz, event.charge);
+          this.rig.shake(0.2 + event.charge * 0.25);
+        }
         break;
       }
       case 'net':
@@ -247,20 +247,15 @@ export class SceneView {
         this.rig.shake(0.12);
         break;
       case 'land':
-      case 'jump': {
-        const p = world.players[event.side];
-        this.fx.burst(p.pos.x, 0.05, p.pos.z, { count: 5, speed: 0.9, up: 0.7, size: 0.12, life: 0.3, color: 0xcfe6ff, gravity: 2 });
+      case 'jump':
+        this.fx.burst(event.x, 0.05, event.z, { count: 5, speed: 0.9, up: 0.7, size: 0.12, life: 0.3, color: 0xcfe6ff, gravity: 2 });
         break;
-      }
+      case 'charge-full':
+        this.rigs[event.side].racketHead(this.racket);
+        this.fx.chargeReady(event.side, this.rigs[event.side].root.position.x, this.rigs[event.side].root.position.z, this.racket);
+        break;
       case 'point':
         this.stadium.roar(event.reason === 'winner' || event.reason === 'ace' ? 1 : 0.6);
-        break;
-      case 'serve-ready':
-        this.fx.clearScuffs();
-        this.ball.resetTrail(world.ball.pos.x, world.ball.pos.y, world.ball.pos.z);
-        break;
-      case 'toss':
-        this.ball.resetTrail(world.ball.pos.x, world.ball.pos.y, world.ball.pos.z);
         break;
       case 'match-end':
         this.stadium.roar(1);
@@ -270,16 +265,21 @@ export class SceneView {
     }
   }
 
-  /** Clears marks left on court by the previous match. */
-  resetForNewMatch(world: World): void {
-    const { x, y, z } = world.ball.pos;
+  /** Clears marks left on court and restarts the ball's trail. */
+  resetCourt(frame: SceneFrame): void {
+    const { x, y, z } = frame.ball.pos;
     this.fx.clearScuffs();
     this.ball.resetTrail(x, y, z);
   }
 
+  resetTrail(frame: SceneFrame): void {
+    const { x, y, z } = frame.ball.pos;
+    this.ball.resetTrail(x, y, z);
+  }
+
   /** Small dust puffs from a sprinting player. */
-  footDust(world: World): void {
-    for (const p of world.players) {
+  footDust(frame: SceneFrame): void {
+    for (const p of frame.players) {
       const speed = Math.hypot(p.vel.x, p.vel.z);
       if (p.onGround && speed > 4.6 && Math.random() < 0.09) {
         this.fx.burst(p.pos.x, 0.05, p.pos.z, { count: 1, speed: 0.3, up: 0.35, size: 0.1, life: 0.26, color: 0xa9cbea, gravity: 1 });

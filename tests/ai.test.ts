@@ -22,6 +22,7 @@ const CASUAL_PLAYER: AIProfile = {
   judgement: 0.3,
   serveU: 0.35,
   serveV: 0.62,
+  chargeChance: 0.04,
 };
 
 const SKILLED_PLAYER: AIProfile = {
@@ -42,6 +43,7 @@ const SKILLED_PLAYER: AIProfile = {
   judgement: 0.8,
   serveU: 0.7,
   serveV: 0.85,
+  chargeChance: 0.12,
 };
 
 describe('AI matches', () => {

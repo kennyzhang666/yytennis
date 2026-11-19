@@ -82,8 +82,8 @@ function buildScenery(): Group {
   const group = new Group();
 
   const clouds = [];
-  for (let i = 0; i < 16; i++) {
-    const angle = Math.PI * (1.08 + (i / 15) * 0.84);
+  for (let i = 0; i < 24; i++) {
+    const angle = (i / 24) * Math.PI * 2 + 0.2;
     const distance = 190 + (i % 3) * 34;
     const x = Math.cos(angle) * distance;
     const z = Math.sin(angle) * distance;
@@ -98,8 +98,8 @@ function buildScenery(): Group {
   group.add(new Mesh(merge(clouds), new MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.78, depthWrite: false })));
 
   const hills = [];
-  for (let i = 0; i < 12; i++) {
-    const angle = Math.PI * (1 + i / 11);
+  for (let i = 0; i < 18; i++) {
+    const angle = (i / 18) * Math.PI * 2;
     const r = 150 + (i % 2) * 18;
     hills.push(
       new SphereGeometry(44 + (i % 3) * 10, 12, 6)
@@ -110,9 +110,8 @@ function buildScenery(): Group {
   group.add(new Mesh(merge(hills), new MeshBasicMaterial({ color: 0x9fcdb6 })));
 
   const trees = [];
-  for (let i = 0; i < 46; i++) {
-    const t = i / 45;
-    const angle = Math.PI * (1.02 + t * 0.96);
+  for (let i = 0; i < 80; i++) {
+    const angle = (i / 80) * Math.PI * 2;
     const r = 58 + ((i * 13) % 9) * 2;
     const h = 8 + ((i * 7) % 5);
     trees.push(new ConeGeometry(3.2, h, 6).translate(Math.cos(angle) * r, h / 2 - 0.5, Math.sin(angle) * r));
@@ -124,13 +123,6 @@ function buildScenery(): Group {
     new MeshLambertMaterial({ color: 0x6fb98b }),
   );
   group.add(ground);
-
-  // On tall screens this strip sits behind the thumbs, so it stays dark and calm.
-  const foreground = new Mesh(
-    new PlaneGeometry(160, 70).rotateX(-Math.PI / 2).translate(0, -0.04, SURFACE.halfZ + 35),
-    new MeshBasicMaterial({ color: 0x0c4f49 }),
-  );
-  group.add(foreground);
   return group;
 }
 
@@ -142,53 +134,35 @@ interface Bank {
   length: number;
 }
 
+interface Seat {
+  x: number;
+  y: number;
+  z: number;
+  ox: number;
+  oz: number;
+}
+
+const ROWS = 8;
+
 export class Stadium {
   readonly group = new Group();
+  /** Hidden in play, where the camera sits behind it; replays look that way. */
+  private readonly nearStand = new Group();
+  private readonly foreground: Mesh;
   private readonly crowdMaterial: MeshLambertMaterial;
   private readonly uniforms = { uTime: { value: 0 }, uCheer: { value: 0.08 } };
   private cheer = 0;
 
   constructor(crowdSpacing: number) {
     this.group.add(buildSky(), buildScenery());
+    this.foreground = new Mesh(
+      // On tall screens this strip sits behind the thumbs, so it stays dark and calm.
+      new PlaneGeometry(160, 70).rotateX(-Math.PI / 2).translate(0, -0.04, SURFACE.halfZ + 35),
+      new MeshBasicMaterial({ color: 0x0c4f49 }),
+    );
+    this.group.add(this.foreground);
     this.buildWalls();
 
-    const banks: Bank[] = [
-      { ox: 1, oz: 0, start: SURFACE.halfX + 0.55, length: 38 },
-      { ox: -1, oz: 0, start: SURFACE.halfX + 0.55, length: 38 },
-      { ox: 0, oz: -1, start: SURFACE.halfZ + 0.55, length: 2 * (SURFACE.halfX + 0.55 + 7.2) },
-    ];
-    const steps = [];
-    const rows = 8;
-    const positions: { x: number; y: number; z: number; ox: number; oz: number }[] = [];
-    for (const bank of banks) {
-      const alongX = bank.oz !== 0;
-      for (let row = 0; row < rows; row++) {
-        const distance = bank.start + 0.45 + row * 0.9;
-        const height = WALL_HEIGHT + 0.25 + row * 0.5;
-        const w = alongX ? bank.length : 0.92;
-        const d = alongX ? 0.92 : bank.length;
-        steps.push(
-          new BoxGeometry(w, height, d).translate(bank.ox * distance, height / 2, bank.oz * distance),
-        );
-        for (let s = -bank.length / 2 + 0.5; s < bank.length / 2 - 0.3; s += crowdSpacing) {
-          if (Math.abs(s) * 7919 % 100 < 16 + ((row * 37) % 11)) continue;
-          positions.push({
-            x: bank.ox * distance + (alongX ? s : 0),
-            y: height,
-            z: bank.oz * distance + (alongX ? 0 : s),
-            ox: bank.ox,
-            oz: bank.oz,
-          });
-        }
-      }
-    }
-    const standMaterial = new MeshLambertMaterial({ color: 0x2f4a6b });
-    this.group.add(new Mesh(merge(steps), standMaterial));
-
-    const person = merge([
-      new BoxGeometry(0.38, 0.5, 0.28).translate(0, 0.25, 0),
-      new SphereGeometry(0.135, 8, 6).translate(0, 0.66, 0),
-    ]);
     this.crowdMaterial = new MeshLambertMaterial({ color: 0xffffff });
     this.crowdMaterial.onBeforeCompile = (shader) => {
       shader.uniforms.uTime = this.uniforms.uTime;
@@ -202,22 +176,71 @@ export class Stadium {
            transformed.y += abs(sin(uTime * (3.0 + fract(seed) * 2.0) + seed)) * uCheer;`,
         );
     };
-    const crowd = new InstancedMesh(person, this.crowdMaterial, positions.length);
+
+    const sideReach = SURFACE.halfX + 0.55;
+    const endReach = SURFACE.halfZ + 0.55;
+    const endLength = 2 * (sideReach + 7.2);
+    this.group.add(
+      this.buildBanks(
+        [
+          { ox: 1, oz: 0, start: sideReach, length: 38 },
+          { ox: -1, oz: 0, start: sideReach, length: 38 },
+          { ox: 0, oz: -1, start: endReach, length: endLength },
+        ],
+        crowdSpacing,
+      ),
+    );
+    this.nearStand.add(this.buildBanks([{ ox: 0, oz: 1, start: endReach, length: endLength }], crowdSpacing * 1.2));
+    this.nearStand.visible = false;
+    this.group.add(this.nearStand);
+
+    this.buildLights();
+    this.buildCourtside();
+  }
+
+  private buildBanks(banks: Bank[], crowdSpacing: number): Group {
+    const group = new Group();
+    const steps = [];
+    const seats: Seat[] = [];
+    for (const bank of banks) {
+      const alongX = bank.oz !== 0;
+      for (let row = 0; row < ROWS; row++) {
+        const distance = bank.start + 0.45 + row * 0.9;
+        const height = WALL_HEIGHT + 0.25 + row * 0.5;
+        const w = alongX ? bank.length : 0.92;
+        const d = alongX ? 0.92 : bank.length;
+        steps.push(new BoxGeometry(w, height, d).translate(bank.ox * distance, height / 2, bank.oz * distance));
+        for (let s = -bank.length / 2 + 0.5; s < bank.length / 2 - 0.3; s += crowdSpacing) {
+          if ((Math.abs(s) * 7919) % 100 < 16 + ((row * 37) % 11)) continue;
+          seats.push({
+            x: bank.ox * distance + (alongX ? s : 0),
+            y: height,
+            z: bank.oz * distance + (alongX ? 0 : s),
+            ox: bank.ox,
+            oz: bank.oz,
+          });
+        }
+      }
+    }
+    group.add(new Mesh(merge(steps), new MeshLambertMaterial({ color: 0x2f4a6b })));
+
+    const person = merge([
+      new BoxGeometry(0.38, 0.5, 0.28).translate(0, 0.25, 0),
+      new SphereGeometry(0.135, 8, 6).translate(0, 0.66, 0),
+    ]);
+    const crowd = new InstancedMesh(person, this.crowdMaterial, seats.length);
     crowd.frustumCulled = false;
     const palette = ['#ff6b5e', '#ffd166', '#f4f1de', '#4cc9f0', '#90e0a0', '#c77dff', '#ff9f68', '#577bc1', '#e8e8f0'].map(
       (c) => new Color(c),
     );
     const matrix = new Matrix4();
-    positions.forEach((p, i) => {
-      const facing = Math.atan2(-p.ox, -p.oz);
-      matrix.makeRotationY(facing).setPosition(p.x, p.y, p.z);
+    seats.forEach((p, i) => {
+      matrix.makeRotationY(Math.atan2(-p.ox, -p.oz)).setPosition(p.x, p.y, p.z);
       crowd.setMatrixAt(i, matrix);
       crowd.setColorAt(i, palette[(i * 7 + (i % 5) * 3) % palette.length]);
     });
-    this.group.add(crowd);
-
-    this.buildLights();
-    this.buildCourtside();
+    group.add(crowd);
+    return group;
   }
 
   private buildWalls(): void {
@@ -287,6 +310,11 @@ export class Stadium {
       );
     }
     this.group.add(new Mesh(merge(benches), new MeshLambertMaterial({ color: 0xff7a59 })));
+  }
+
+  setReplayMode(on: boolean): void {
+    this.nearStand.visible = on;
+    this.foreground.visible = !on;
   }
 
   roar(amount: number): void {

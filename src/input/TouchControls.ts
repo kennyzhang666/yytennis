@@ -78,6 +78,11 @@ export class TouchControls {
     this.onDown(event);
   }
 
+  /** True while a finger rests on the swing side of the screen. */
+  get swingHeld(): boolean {
+    return this.swingId !== -1;
+  }
+
   reset(): void {
     this.stickId = -1;
     this.swingId = -1;
